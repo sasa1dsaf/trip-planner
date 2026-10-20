@@ -440,8 +440,12 @@ def _enrich_meal(
     return True
 
 
-def _enrich_hotel(hotel: HotelItem, city: str | None = None) -> bool:
-    """补全单个酒店的地址和经纬度。"""
+def _enrich_hotel(
+    hotel: HotelItem,
+    city: str | None = None,
+    travelers: int | None = None,
+) -> bool:
+    """补全单个酒店的地址、经纬度、图片和单晚参考价。"""
     place = _pick_best_place(hotel.name, city=city)
     if place is None and hotel.location:
         place = _pick_best_place(hotel.location, city=city)
@@ -461,6 +465,15 @@ def _enrich_hotel(hotel: HotelItem, city: str | None = None) -> bool:
     hotel.longitude = place.get("longitude")
     hotel.poi_id = place.get("poi_id") or hotel.poi_id
     hotel.image_url = place.get("image_url") or hotel.image_url
+
+    average_cost = place.get("average_cost")
+    if (
+        travelers is not None
+        and isinstance(average_cost, (int, float))
+        and average_cost > 0
+    ):
+        rooms = max((int(travelers) + 1) // 2, 1)
+        hotel.estimated_cost = round(float(average_cost) * rooms, 2)
     return True
 
 
@@ -510,6 +523,7 @@ def _enrich_transport(transport: TransportItem, city: str | None = None) -> bool
 
     transport.distance_km = route.get("distance_km")
     transport.estimated_minutes = route.get("estimated_minutes")
+    transport.taxi_cost = route.get("taxi_cost")
     if route.get("estimated_minutes") is not None and not transport.duration:
         transport.duration = f"{route['estimated_minutes']} 分钟"
     return True
@@ -544,7 +558,11 @@ def enrich_itinerary_with_map_data(
 
         if day.hotel is not None:
             try:
-                if _enrich_hotel(day.hotel, city=city or itinerary.destination):
+                if _enrich_hotel(
+                    day.hotel,
+                    city=city or itinerary.destination,
+                    travelers=travelers,
+                ):
                     enriched_count += 1
             except Exception:
                 pass

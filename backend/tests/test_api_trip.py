@@ -164,6 +164,8 @@ def test_generate_trip_returns_dynamic_itinerary_from_candidate_pool(monkeypatch
         "city": "上海",
         "adcode": "310000",
         "administrative_level": "province",
+        "special_notes": payload["special_notes"],
+        "preferences": payload["preferences"],
     }
 
 

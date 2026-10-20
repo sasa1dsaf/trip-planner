@@ -97,6 +97,7 @@ class TransportItem(BaseModel):
     duration: str | None = Field(default=None, description="预计耗时")
     distance_km: float | None = Field(default=None, ge=0, description="预计距离，单位公里")
     estimated_minutes: int | None = Field(default=None, ge=0, description="预计耗时，单位分钟")
+    taxi_cost: float | None = Field(default=None, ge=0, description="高德路线返回的出租车参考价")
 
 
 class BudgetBreakdown(BaseModel):

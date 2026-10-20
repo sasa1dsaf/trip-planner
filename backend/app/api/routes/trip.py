@@ -105,6 +105,8 @@ def generate_trip(request: TripRequest) -> Itinerary:
                 city=city_resolution.city,
                 adcode=city_resolution.adcode,
                 administrative_level=city_resolution.administrative_level,
+                special_notes=request.special_notes,
+                preferences=request.preferences,
             )
         except CandidateCollectionUnavailableError as exc:
             raise HTTPException(

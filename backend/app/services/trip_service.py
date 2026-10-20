@@ -23,7 +23,7 @@ from app.models.schemas import (
     TripEditRequest,
     TripRequest,
 )
-from app.services.map_service import enrich_itinerary_with_map_data
+from app.services.map_service import enrich_itinerary_with_map_data, estimate_route
 from app.services.fallback_candidates import extract_fallback_candidates
 from app.services.place_candidate_service import (
     CityCandidatePool,
@@ -135,6 +135,33 @@ def _estimate_meal_cost(
     return round(per_person * max(int(travelers or 1), 1), 2)
 
 
+_HOTEL_NIGHTLY_CAPS: dict[str, float] = {
+    "经济": 300.0,
+    "舒适": 600.0,
+    "高档": 1000.0,
+    "豪华": 1800.0,
+}
+
+
+def _hotel_rooms(travelers: int) -> int:
+    """按每 2 人 1 间估算房间数。"""
+    return max((int(travelers or 1) + 1) // 2, 1)
+
+
+def _hotel_nights(day_count: int) -> int:
+    """按行程天数估算住宿晚数，至少 1 晚。"""
+    return max(int(day_count) - 1, 1)
+
+
+def _hotel_nightly_cap(hotel_level: str | None) -> float:
+    """没有高德价格时，按酒店档次给出单间每晚上限。"""
+    level = hotel_level or "舒适型"
+    for keyword, cap in _HOTEL_NIGHTLY_CAPS.items():
+        if keyword in level:
+            return cap
+    return _HOTEL_NIGHTLY_CAPS["舒适"]
+
+
 def _hotel_and_transport_shares(hotel_level: str | None) -> tuple[float, float]:
     """返回住宿和交通在剩余预算中的占比，沿用原预算结构的相对比例。"""
     if hotel_level and "豪华" in hotel_level:
@@ -168,8 +195,24 @@ def _allocate_hotel_and_transport_budget(
     remaining = max(target_total - ticket_total - meal_total - other_budget, 0.0)
 
     hotel_share, transport_share = _hotel_and_transport_shares(request.hotel_level)
+    rooms = _hotel_rooms(request.travelers)
+    nights = _hotel_nights(day_count)
+    nightly_rate = next(
+        (
+            day.hotel.estimated_cost
+            for day in itinerary.days
+            if day.hotel is not None and day.hotel.estimated_cost > 0
+        ),
+        0.0,
+    )
+    if nightly_rate > 0:
+        hotel_total = nightly_rate * nights
+    else:
+        cap_total = _hotel_nightly_cap(request.hotel_level) * rooms * nights
+        hotel_total = min(remaining * hotel_share, cap_total)
+
     daily_hotel_costs = _prorate_amounts(
-        remaining * hotel_share,
+        hotel_total,
         _build_hotel_weights(day_count, request.start_date),
     )
     daily_transport_costs = _prorate_amounts(
@@ -314,6 +357,10 @@ def _apply_route_based_transport_costs(itinerary: Itinerary) -> None:
         for transport in day.transport:
             if transport.estimated_minutes is not None:
                 transport.duration = f"{transport.estimated_minutes} 分钟"
+
+            if transport.taxi_cost is not None:
+                transport.estimated_cost = round(float(transport.taxi_cost), 2)
+                continue
 
             if transport.distance_km is None:
                 continue
@@ -492,6 +539,11 @@ def generate_dynamic_trip_itinerary(
         )
 
     hotel_level = request.hotel_level or "舒适型"
+    hotel_nightly_cost = (
+        round(selected_hotel.average_cost * _hotel_rooms(request.travelers), 2)
+        if selected_hotel.average_cost is not None and selected_hotel.average_cost > 0
+        else 0.0
+    )
 
     days: list[DayPlan] = []
     for index, (spot, meal, planner_day) in enumerate(selected_days):
@@ -516,6 +568,20 @@ def generate_dynamic_trip_itinerary(
             else f"{request.destination}第 {index + 1} 天探索"
         )
         current_date = request.start_date + timedelta(days=index)
+        route = None
+        if ENABLE_AMAP_ENRICHMENT:
+            try:
+                route = estimate_route(
+                    selected_hotel.longitude,
+                    selected_hotel.latitude,
+                    spot.longitude,
+                    spot.latitude,
+                )
+            except Exception:
+                route = None
+        route_taxi_cost = route.get("taxi_cost") if route else None
+        route_distance_km = route.get("distance_km") if route else None
+        route_minutes = route.get("estimated_minutes") if route else None
         days.append(
             DayPlan(
                 day_index=index + 1,
@@ -564,7 +630,7 @@ def generate_dynamic_trip_itinerary(
                 hotel=HotelItem(
                     name=selected_hotel.name,
                     level=hotel_level,
-                    estimated_cost=0.0,
+                    estimated_cost=hotel_nightly_cost,
                     location=(
                         selected_hotel.district
                         or selected_hotel.city
@@ -582,7 +648,14 @@ def generate_dynamic_trip_itinerary(
                         from_place=selected_hotel.name,
                         to_place=spot.name,
                         estimated_cost=0.0,
-                        duration="请以实时地图路线为准",
+                        duration=(
+                            f"{route_minutes} 分钟"
+                            if route_minutes is not None
+                            else "请以实时地图路线为准"
+                        ),
+                        distance_km=route_distance_km,
+                        estimated_minutes=route_minutes,
+                        taxi_cost=route_taxi_cost,
                     )
                 ],
                 notes=[

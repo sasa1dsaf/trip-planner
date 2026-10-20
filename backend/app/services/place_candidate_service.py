@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Mapping
@@ -104,6 +106,175 @@ _CATEGORY_LABELS: dict[PlaceCandidateCategory, str] = {
     PlaceCandidateCategory.MEAL: "餐饮",
     PlaceCandidateCategory.HOTEL: "住宿",
 }
+
+_REQUEST_SPLIT_PATTERN = re.compile(r"[\s,，。；;、/|]+")
+_REQUEST_PREFIX_PATTERN = re.compile(
+    r"^(?:想去|要去|去|到|想|要|希望|计划|安排|参观|游览|游玩|打卡|看看|逛一逛|逛|体验)+"
+)
+_REQUEST_SUFFIX_PATTERN = re.compile(
+    r"(?:一日游|半日游|一天|两天|三天|上午|下午|晚上|附近|周边|等)+$"
+)
+_SPOT_NAME_HINTS = (
+    "楼",
+    "湖",
+    "山",
+    "寺",
+    "塔",
+    "园",
+    "馆",
+    "院",
+    "城",
+    "街",
+    "巷",
+    "桥",
+    "宫",
+    "陵",
+    "峰",
+    "岛",
+    "谷",
+    "洞",
+    "泉",
+    "瀑布",
+    "古镇",
+    "古城",
+    "大学",
+    "公园",
+    "景区",
+    "广场",
+    "纪念",
+    "博物",
+    "美术",
+    "游乐",
+    "度假",
+    "长城",
+    "水镇",
+    "乐园",
+    "湿地",
+    "码头",
+)
+_GENERIC_PREFERENCE_WORDS = {
+    "自然风景",
+    "拍照",
+    "美食",
+    "小吃",
+    "休闲",
+    "摄影",
+    "出片",
+    "亲子",
+    "浪漫",
+    "购物",
+    "夜景",
+    "博物馆",
+    "公园",
+    "古镇",
+    "古城",
+    "度假",
+    "游乐",
+    "温泉",
+    "演出",
+}
+
+
+def _normalize_match_text(value: str) -> str:
+    """去掉空白和常见标点，便于比较用户点名与高德 POI 名称。"""
+    return re.sub(r"[\s()（）·\-—_]+", "", value).lower()
+
+
+def _clean_requested_spot_token(token: str, city: str) -> list[str]:
+    """从备注片段中提取可能的景点名称，并生成去掉城市名的变体。"""
+    cleaned = _REQUEST_PREFIX_PATTERN.sub("", token.strip())
+    cleaned = _REQUEST_SUFFIX_PATTERN.sub("", cleaned).strip()
+    without_city = _REQUEST_PREFIX_PATTERN.sub("", cleaned.replace(city, "")).strip()
+
+    variants: list[str] = []
+    for candidate in (cleaned, without_city):
+        if not candidate or candidate in _GENERIC_PREFERENCE_WORDS:
+            continue
+        if not 2 <= len(candidate) <= 20:
+            continue
+        if not any(hint in candidate for hint in _SPOT_NAME_HINTS):
+            continue
+        if candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
+def _extract_requested_spot_queries(
+    special_notes: str | None,
+    preferences: list[str] | None,
+    city: str,
+) -> list[str]:
+    """从用户备注和偏好中提取明确点名的景点查询词。"""
+    text_parts = [part for part in (special_notes, "、".join(preferences or [])) if part]
+    queries: list[str] = []
+    for part in text_parts:
+        for token in _REQUEST_SPLIT_PATTERN.split(part):
+            for query in _clean_requested_spot_token(token, city):
+                if query not in queries:
+                    queries.append(query)
+    return queries[:6]
+
+
+def _search_requested_spot_candidates(
+    queries: list[str],
+    city: str,
+    adcode: str | None,
+    administrative_level: str | None,
+) -> list[PlaceCandidate]:
+    """逐个按名称查询高德并转成候选；查不到时静默跳过。"""
+    candidates: list[PlaceCandidate] = []
+    seen_ids: set[str] = set()
+
+    for query in queries:
+        normalized_query = _normalize_match_text(query)
+        if any(
+            normalized_query in _normalize_match_text(candidate.name)
+            or _normalize_match_text(candidate.name) in normalized_query
+            for candidate in candidates
+        ):
+            continue
+
+        places: list[dict[str, object]] = []
+        for attempt in range(2):
+            try:
+                places = search_places(
+                    keyword=query,
+                    city=adcode or normalize_city_name(city),
+                    page_size=5,
+                    city_limit=True,
+                )
+                break
+            except AmapServiceError as exc:
+                if exc.reason == "10021" and attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                break
+            except (httpx.HTTPError, RuntimeError):
+                break
+
+        for place in places:
+            candidate = _to_candidate(
+                place,
+                city=city,
+                category=PlaceCandidateCategory.SPOT,
+                adcode=adcode,
+                administrative_level=administrative_level,
+            )
+            if candidate is None:
+                continue
+            normalized_name = _normalize_match_text(candidate.name)
+            if (
+                normalized_query not in normalized_name
+                and normalized_name not in normalized_query
+            ):
+                continue
+            if candidate.poi_id in seen_ids:
+                continue
+            seen_ids.add(candidate.poi_id)
+            candidates.append(candidate)
+            break
+
+    return candidates
 
 
 def _place_text(value: object) -> str:
@@ -255,6 +426,8 @@ def collect_city_candidate_pool(
     administrative_level: str | None = None,
     page_size: int = 25,
     minimum_counts: Mapping[PlaceCandidateCategory, int] | None = None,
+    special_notes: str | None = None,
+    preferences: list[str] | None = None,
 ) -> CityCandidatePool:
     """采集城市三类候选，并计算是否达到动态规划最低覆盖。"""
     normalized_city = normalize_city_name(city)
@@ -301,6 +474,25 @@ def collect_city_candidate_pool(
             adcode=adcode,
             administrative_level=administrative_level,
         )
+
+    requested_queries = _extract_requested_spot_queries(
+        special_notes,
+        preferences,
+        normalized_city,
+    )
+    requested_spots = _search_requested_spot_candidates(
+        requested_queries,
+        city=normalized_city,
+        adcode=adcode,
+        administrative_level=administrative_level,
+    )
+    if requested_spots:
+        requested_ids = {candidate.poi_id for candidate in requested_spots}
+        candidates[PlaceCandidateCategory.SPOT] = requested_spots + [
+            candidate
+            for candidate in candidates[PlaceCandidateCategory.SPOT]
+            if candidate.poi_id not in requested_ids
+        ]
 
     return CityCandidatePool(
         city=normalized_city,
