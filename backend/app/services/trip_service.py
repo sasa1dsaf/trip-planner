@@ -45,6 +45,49 @@ TECHNICAL_TIP_KEYWORDS = (
     "trip_service",
 )
 
+_MEAL_COST_FALLBACKS: tuple[tuple[tuple[str, ...], float], ...] = (
+    (("小吃", "面", "粉", "米线", "饺子", "包子", "快餐", "粥"), 30.0),
+    (("火锅", "私房菜", "正餐", "餐厅", "饭店", "烤鸭", "海鲜"), 90.0),
+)
+_DEFAULT_MEAL_COST_PER_PERSON = 50.0
+
+_THEME_PARK_KEYWORDS = (
+    "环球影城",
+    "环球度假区",
+    "迪士尼",
+    "长隆",
+    "欢乐谷",
+    "方特",
+    "乐高乐园",
+    "海洋公园",
+    "主题公园",
+    "乐园",
+    "游乐场",
+)
+
+# 常见景点的人均门票参考价；0 表示免费景点。
+_KNOWN_PER_PERSON_TICKET_PRICES: tuple[tuple[str, float], ...] = (
+    ("环球影城", 500.0),
+    ("环球度假区", 500.0),
+    ("故宫", 60.0),
+    ("颐和园", 30.0),
+    ("天坛", 34.0),
+    ("八达岭长城", 40.0),
+    ("慕田峪长城", 45.0),
+    ("古北水镇", 140.0),
+    ("雍和宫", 25.0),
+    ("恭王府", 40.0),
+    ("圆明园", 25.0),
+    ("北海公园", 10.0),
+    ("景山公园", 2.0),
+    ("崇圣寺三塔", 75.0),
+    ("大理古城", 0.0),
+    ("喜洲古镇", 0.0),
+    ("南锣鼓巷", 0.0),
+    ("什刹海", 0.0),
+    ("洱海", 0.0),
+)
+
 
 def _clean_user_tips(tips: list[str], destination: str | None = None) -> list[str]:
     """过滤内部实现说明，只保留用户真正能用到的旅行建议。"""
@@ -67,6 +110,81 @@ def _clean_user_tips(tips: list[str], destination: str | None = None) -> list[st
         "古镇、生态廊道和石板路更适合慢慢走，鞋子尽量选择舒适防滑的款式。",
         "热门景点建议错峰出发，给拍照、用餐和交通预留更从容的缓冲时间。",
     ]
+
+
+def _fallback_meal_cost_per_person(name: str | None) -> float:
+    """按餐饮类型给出人均兜底价格，避免把整日预算挂到一顿饭上。"""
+    text = (name or "").strip()
+    for keywords, price in _MEAL_COST_FALLBACKS:
+        if any(keyword in text for keyword in keywords):
+            return price
+    return _DEFAULT_MEAL_COST_PER_PERSON
+
+
+def _estimate_meal_cost(
+    name: str | None,
+    travelers: int,
+    average_cost_per_person: float | None = None,
+) -> float:
+    """优先使用高德人均消费，否则使用类型兜底价，再乘以出行人数。"""
+    per_person = (
+        float(average_cost_per_person)
+        if average_cost_per_person is not None and average_cost_per_person > 0
+        else _fallback_meal_cost_per_person(name)
+    )
+    return round(per_person * max(int(travelers or 1), 1), 2)
+
+
+def _hotel_and_transport_shares(hotel_level: str | None) -> tuple[float, float]:
+    """返回住宿和交通在剩余预算中的占比，沿用原预算结构的相对比例。"""
+    if hotel_level and "豪华" in hotel_level:
+        hotel, transport = 0.62, 0.12
+    elif hotel_level and ("高档" in hotel_level or "高端" in hotel_level):
+        hotel, transport = 0.56, 0.16
+    elif hotel_level and "经济" in hotel_level:
+        hotel, transport = 0.40, 0.32
+    else:
+        hotel, transport = 0.50, 0.22
+    total = hotel + transport
+    return hotel / total, transport / total
+
+
+def _allocate_hotel_and_transport_budget(
+    itinerary: Itinerary,
+    request: TripRequest,
+) -> Itinerary:
+    """餐饮和门票确定后，只把剩余预算分配给住宿和交通。"""
+    day_count = max(len(itinerary.days), 1)
+    ticket_total = sum(
+        item.estimated_cost for day in itinerary.days for item in day.spots
+    )
+    meal_total = sum(
+        item.estimated_cost for day in itinerary.days for item in day.meals
+    )
+    target_total = request.budget * (
+        0.78 if request.pace == "轻松" else 0.92 if request.pace == "紧凑" else 0.85
+    )
+    other_budget = request.budget * (0.05 + min(day_count, 4) * 0.01)
+    remaining = max(target_total - ticket_total - meal_total - other_budget, 0.0)
+
+    hotel_share, transport_share = _hotel_and_transport_shares(request.hotel_level)
+    daily_hotel_costs = _prorate_amounts(
+        remaining * hotel_share,
+        _build_hotel_weights(day_count, request.start_date),
+    )
+    daily_transport_costs = _prorate_amounts(
+        remaining * transport_share,
+        _build_transport_weights(day_count, request.pace),
+    )
+
+    for index, day in enumerate(itinerary.days):
+        if day.hotel is not None:
+            day.hotel.estimated_cost = daily_hotel_costs[index]
+        if day.transport:
+            per_item_cost = round(daily_transport_costs[index] / len(day.transport), 2)
+            for transport in day.transport:
+                transport.estimated_cost = per_item_cost
+    return itinerary
 
 
 def _requests_no_fixed_spot(instruction: str) -> bool:
@@ -112,18 +230,48 @@ def _prorate_amounts(total: float, weights: list[float]) -> list[float]:
     return [round(value / 100, 2) for value in base_cents]
 
 
-def _estimate_ticket_cost(spot_name: str, description: str | None = None) -> float:
-    """根据景点关键词估算门票，更接近真实行程而不是固定数值。"""
+def _estimate_ticket_cost(
+    spot_name: str,
+    description: str | None = None,
+    travelers: int = 1,
+) -> float:
+    """按人均门票估算总价，主题乐园等高价景点优先匹配。"""
     text = f"{spot_name} {description or ''}"
-    bucket = _stable_bucket(text, 4)
+    travelers = max(int(travelers or 1), 1)
 
-    if any(keyword in text for keyword in ("古城", "古镇", "公园", "廊道", "村", "湿地", "街区")):
-        return [0.0, 20.0, 30.0, 40.0][bucket]
-    if any(keyword in text for keyword in ("寺", "三塔", "博物馆", "遗址", "山庄")):
-        return round(60.0 + (bucket * 18.0), 2)
-    if any(keyword in text for keyword in ("索道", "缆车", "游船", "演出", "雪山")):
-        return round(120.0 + (bucket * 28.0), 2)
-    return round(35.0 + (bucket * 12.0), 2)
+    known_price = next(
+        (
+            price
+            for keyword, price in _KNOWN_PER_PERSON_TICKET_PRICES
+            if keyword in text
+        ),
+        None,
+    )
+    if known_price is not None:
+        return round(known_price * travelers, 2)
+
+    if any(keyword in text for keyword in _THEME_PARK_KEYWORDS):
+        return round(500.0 * travelers, 2)
+
+    bucket = _stable_bucket(text, 4)
+    if any(keyword in text for keyword in ("动物园", "海洋馆", "水族馆")):
+        per_person = 150.0
+    elif any(keyword in text for keyword in ("博物馆", "纪念馆", "展览馆")):
+        per_person = 0.0
+    elif "长城" in text:
+        per_person = 45.0
+    elif any(keyword in text for keyword in ("索道", "缆车", "游船", "演出", "雪山")):
+        per_person = 120.0 + (bucket * 28.0)
+    elif any(keyword in text for keyword in ("寺", "三塔", "遗址", "山庄")):
+        per_person = 60.0 + (bucket * 18.0)
+    elif any(
+        keyword in text
+        for keyword in ("古城", "古镇", "公园", "廊道", "村", "湿地", "街区", "园")
+    ):
+        per_person = [0.0, 20.0, 30.0, 40.0][bucket]
+    else:
+        per_person = 35.0 + (bucket * 12.0)
+    return round(per_person * travelers, 2)
 
 
 def _build_hotel_weights(day_count: int, start_date: DateType) -> list[float]:
@@ -226,16 +374,23 @@ def _refresh_budget_breakdown(itinerary: Itinerary, request_budget: float | None
 def _maybe_enrich_itinerary_with_map_data(
     itinerary: Itinerary,
     city: str | None = None,
-    request_budget: float | None = None,
+    travelers: int | None = None,
 ) -> Itinerary:
-    """按开关补充地图信息，并在最后统一刷新预算。"""
+    """按开关补充地图信息；预算分配和汇总由调用方负责。"""
     if ENABLE_AMAP_ENRICHMENT:
         try:
-            itinerary = enrich_itinerary_with_map_data(itinerary, city=city)
+            if travelers is None:
+                itinerary = enrich_itinerary_with_map_data(itinerary, city=city)
+            else:
+                itinerary = enrich_itinerary_with_map_data(
+                    itinerary,
+                    city=city,
+                    travelers=travelers,
+                )
         except Exception:
             pass
 
-    return _refresh_budget_breakdown(itinerary, request_budget=request_budget)
+    return itinerary
 
 
 def _validated_dynamic_draft(
@@ -329,44 +484,14 @@ def generate_dynamic_trip_itinerary(
         )
         selected_days.append((selected_spot, selected_meal, planner_day))
         ticket_costs.append(
-            _estimate_ticket_cost(selected_spot.name, selected_spot.type_name)
+            _estimate_ticket_cost(
+                selected_spot.name,
+                selected_spot.type_name,
+                travelers=request.travelers,
+            )
         )
 
-    ticket_total = round(sum(ticket_costs), 2)
-    target_total = request.budget * (
-        0.78 if request.pace == "轻松" else 0.92 if request.pace == "紧凑" else 0.85
-    )
-    other_budget = round(request.budget * (0.05 + min(day_count, 4) * 0.01), 2)
-    allocatable_budget = max(
-        target_total - ticket_total - other_budget,
-        request.budget * 0.45,
-    )
-
     hotel_level = request.hotel_level or "舒适型"
-    if "豪华" in hotel_level:
-        hotel_ratio = 0.62
-    elif "高档" in hotel_level or "高端" in hotel_level:
-        hotel_ratio = 0.56
-    elif "经济" in hotel_level:
-        hotel_ratio = 0.40
-    else:
-        hotel_ratio = 0.50
-    meal_ratio = 0.28 if "美食" in request.preferences else 0.22
-    transport_ratio = max(0.12, 1 - hotel_ratio - meal_ratio)
-    ratio_sum = hotel_ratio + meal_ratio + transport_ratio
-
-    daily_hotel_costs = _prorate_amounts(
-        allocatable_budget * hotel_ratio / ratio_sum,
-        _build_hotel_weights(day_count, request.start_date),
-    )
-    daily_meal_costs = _prorate_amounts(
-        allocatable_budget * meal_ratio / ratio_sum,
-        _build_meal_weights(day_count, request.preferences),
-    )
-    daily_transport_costs = _prorate_amounts(
-        allocatable_budget * transport_ratio / ratio_sum,
-        _build_transport_weights(day_count, request.pace),
-    )
 
     days: list[DayPlan] = []
     for index, (spot, meal, planner_day) in enumerate(selected_days):
@@ -423,7 +548,11 @@ def generate_dynamic_trip_itinerary(
                     MealItem(
                         name=meal.name,
                         meal_type="午餐",
-                        estimated_cost=daily_meal_costs[index],
+                        estimated_cost=_estimate_meal_cost(
+                            meal.name,
+                            request.travelers,
+                            meal.average_cost,
+                        ),
                         notes=meal_notes,
                         address=meal.address,
                         latitude=meal.latitude,
@@ -435,7 +564,7 @@ def generate_dynamic_trip_itinerary(
                 hotel=HotelItem(
                     name=selected_hotel.name,
                     level=hotel_level,
-                    estimated_cost=daily_hotel_costs[index],
+                    estimated_cost=0.0,
                     location=(
                         selected_hotel.district
                         or selected_hotel.city
@@ -452,7 +581,7 @@ def generate_dynamic_trip_itinerary(
                         mode="公共交通 / 打车",
                         from_place=selected_hotel.name,
                         to_place=spot.name,
-                        estimated_cost=daily_transport_costs[index],
+                        estimated_cost=0.0,
                         duration="请以实时地图路线为准",
                     )
                 ],
@@ -486,6 +615,7 @@ def generate_dynamic_trip_itinerary(
     itinerary = Itinerary(
         trip_id=f"trip_{request.destination}_{request.start_date.isoformat()}",
         destination=request.destination,
+        travelers=request.travelers,
         summary=summary,
         days=days,
         estimated_budget=0.0,
@@ -497,6 +627,7 @@ def generate_dynamic_trip_itinerary(
             planner_completion_tokens=planner_usage.get("completion_tokens", 0),
         ),
     )
+    _allocate_hotel_and_transport_budget(itinerary, request)
     return _refresh_budget_breakdown(itinerary, request_budget=request.budget)
 
 
@@ -598,7 +729,15 @@ def generate_trip_itinerary(request: TripRequest) -> Itinerary:
         if fallback_hotel_name is None:
             unavailable_notes.append("未从当前攻略检索到住宿信息，未安排住宿。")
 
-        ticket_cost = _estimate_ticket_cost(spot_name, spot_description) if spot_name else 0.0
+        ticket_cost = (
+            _estimate_ticket_cost(
+                spot_name,
+                spot_description,
+                travelers=request.travelers,
+            )
+            if spot_name
+            else 0.0
+        )
 
         raw_days.append(
             {
@@ -616,43 +755,7 @@ def generate_trip_itinerary(request: TripRequest) -> Itinerary:
         )
         ticket_costs.append(ticket_cost)
 
-    ticket_total = round(sum(ticket_costs), 2)
-    target_total = request.budget * (
-        0.78 if request.pace == "轻松" else 0.92 if request.pace == "紧凑" else 0.85
-    )
-    other_budget = round(request.budget * (0.05 + min(day_count, 4) * 0.01), 2)
-    allocatable_budget = max(target_total - ticket_total - other_budget, request.budget * 0.45)
-
     hotel_level = request.hotel_level or "舒适型"
-    if "豪华" in hotel_level:
-        hotel_ratio = 0.62
-    elif "高档" in hotel_level or "高端" in hotel_level:
-        hotel_ratio = 0.56
-    elif "经济" in hotel_level:
-        hotel_ratio = 0.40
-    else:
-        hotel_ratio = 0.50
-
-    meal_ratio = 0.28 if "美食" in request.preferences else 0.22
-    transport_ratio = max(0.12, 1 - hotel_ratio - meal_ratio)
-    ratio_sum = hotel_ratio + meal_ratio + transport_ratio
-
-    hotel_total = allocatable_budget * hotel_ratio / ratio_sum
-    meal_total = allocatable_budget * meal_ratio / ratio_sum
-    transport_total = allocatable_budget * transport_ratio / ratio_sum
-
-    daily_hotel_costs = _prorate_amounts(
-        hotel_total,
-        _build_hotel_weights(day_count, request.start_date),
-    )
-    daily_meal_costs = _prorate_amounts(
-        meal_total,
-        _build_meal_weights(day_count, request.preferences),
-    )
-    daily_transport_costs = _prorate_amounts(
-        transport_total,
-        _build_transport_weights(day_count, request.pace),
-    )
 
     days: list[DayPlan] = []
     for index, raw_day in enumerate(raw_days):
@@ -686,7 +789,10 @@ def generate_trip_itinerary(request: TripRequest) -> Itinerary:
                     MealItem(
                         name=str(meal_name),
                         meal_type="午餐",
-                        estimated_cost=daily_meal_costs[index],
+                        estimated_cost=_estimate_meal_cost(
+                            str(meal_name),
+                            request.travelers,
+                        ),
                         notes=str(raw_day["meal_note"]),
                     )
                 ]
@@ -697,7 +803,7 @@ def generate_trip_itinerary(request: TripRequest) -> Itinerary:
                 HotelItem(
                     name=fallback_hotel_name,
                     level=hotel_level,
-                    estimated_cost=daily_hotel_costs[index],
+                    estimated_cost=0.0,
                     location=request.destination,
                 )
                 if fallback_hotel_name
@@ -709,7 +815,7 @@ def generate_trip_itinerary(request: TripRequest) -> Itinerary:
                         mode="打车",
                         from_place=f"{request.destination} 出发点",
                         to_place=str(spot_name),
-                        estimated_cost=daily_transport_costs[index],
+                        estimated_cost=0.0,
                         duration="30 分钟",
                     )
                 ]
@@ -750,6 +856,7 @@ def generate_trip_itinerary(request: TripRequest) -> Itinerary:
     itinerary = Itinerary(
         trip_id=f"trip_{request.destination}_{request.start_date.isoformat()}",
         destination=request.destination,
+        travelers=request.travelers,
         summary=summary,
         days=days,
         estimated_budget=0.0,
@@ -758,11 +865,13 @@ def generate_trip_itinerary(request: TripRequest) -> Itinerary:
         source_notes=source_notes,
         token_usage=token_usage,
     )
-    return _maybe_enrich_itinerary_with_map_data(
+    itinerary = _maybe_enrich_itinerary_with_map_data(
         itinerary,
         city=request.destination,
-        request_budget=request.budget,
+        travelers=request.travelers,
     )
+    _allocate_hotel_and_transport_budget(itinerary, request)
+    return _refresh_budget_breakdown(itinerary, request_budget=request.budget)
 
 
 def edit_trip_itinerary(request: TripEditRequest) -> Itinerary:
@@ -807,6 +916,7 @@ def edit_trip_itinerary(request: TripEditRequest) -> Itinerary:
                 target_day.spots[0].estimated_cost = _estimate_ticket_cost(
                     target_day.spots[0].name,
                     day_edit_draft.spot_description,
+                    travelers=updated_itinerary.travelers,
                 )
                 if not spot_is_grounded:
                     target_day.spots[0].address = None
@@ -863,8 +973,11 @@ def edit_trip_itinerary(request: TripEditRequest) -> Itinerary:
         or updated_itinerary.budget_breakdown.total
         or None
     )
-    return _maybe_enrich_itinerary_with_map_data(
+    updated_itinerary = _maybe_enrich_itinerary_with_map_data(
         updated_itinerary,
         city=updated_itinerary.destination,
+    )
+    return _refresh_budget_breakdown(
+        updated_itinerary,
         request_budget=reference_budget,
     )

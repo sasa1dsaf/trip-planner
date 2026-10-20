@@ -52,6 +52,7 @@ class PlaceCandidate:
     latitude: float
     longitude: float
     image_url: str | None
+    average_cost: float | None = None
     source_type: str = "amap_poi"
 
 
@@ -194,6 +195,13 @@ def _to_candidate(
     if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
         return None
 
+    raw_average_cost = place.get("average_cost")
+    average_cost = (
+        float(raw_average_cost)
+        if isinstance(raw_average_cost, (int, float)) and raw_average_cost > 0
+        else None
+    )
+
     return PlaceCandidate(
         poi_id=poi_id,
         name=name,
@@ -205,6 +213,7 @@ def _to_candidate(
         latitude=float(latitude),
         longitude=float(longitude),
         image_url=_place_text(place.get("image_url")) or None,
+        average_cost=average_cost,
     )
 
 

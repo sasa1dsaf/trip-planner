@@ -12,7 +12,7 @@ from app.config import (
     AMAP_TIMEOUT_SECONDS,
     REDIS_MAP_TTL_SECONDS,
 )
-from app.models.schemas import HotelItem, Itinerary, SpotItem, TransportItem
+from app.models.schemas import HotelItem, Itinerary, MealItem, SpotItem, TransportItem
 from app.services.cache_service import get_cached_json, set_cached_json
 
 
@@ -101,6 +101,22 @@ def _parse_float(value: str | None) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_average_cost(value: Any) -> float | None:
+    """解析高德 POI 的人均消费；空值、非数字和非正数都视为缺失。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        cost = float(value)
+    elif isinstance(value, str):
+        parsed = _parse_float(value.strip())
+        if parsed is None:
+            return None
+        cost = parsed
+    else:
+        return None
+    return cost if cost > 0 else None
 
 
 def _split_location(location: str | None) -> tuple[float | None, float | None]:
@@ -268,6 +284,7 @@ def search_places(
         latitude, longitude = _split_location(poi.get("location"))
         photos = poi.get("photos") if isinstance(poi.get("photos"), list) else []
         first_photo = photos[0] if photos and isinstance(photos[0], dict) else {}
+        biz_ext = poi.get("biz_ext") if isinstance(poi.get("biz_ext"), dict) else {}
         results.append(
             {
                 "name": poi.get("name"),
@@ -279,6 +296,7 @@ def search_places(
                 "type": poi.get("type"),
                 "poi_id": poi.get("id"),
                 "image_url": first_photo.get("url"),
+                "average_cost": _parse_average_cost(biz_ext.get("cost")),
                 "latitude": latitude,
                 "longitude": longitude,
             }
@@ -393,6 +411,35 @@ def _enrich_spot(spot: SpotItem, city: str | None = None) -> bool:
     return True
 
 
+def _enrich_meal(
+    meal: MealItem,
+    city: str | None = None,
+    travelers: int | None = None,
+) -> bool:
+    """补全餐饮地点信息，并在高德返回人均消费时按人数重算餐费。"""
+    place = _pick_best_place(meal.name, city=city)
+    if place is None:
+        return False
+
+    meal.address = place.get("address") or meal.address
+    meal.image_url = place.get("image_url") or meal.image_url
+    meal.latitude = place.get("latitude")
+    meal.longitude = place.get("longitude")
+    meal.poi_id = place.get("poi_id") or meal.poi_id
+
+    average_cost = place.get("average_cost")
+    if (
+        travelers is not None
+        and isinstance(average_cost, (int, float))
+        and average_cost > 0
+    ):
+        meal.estimated_cost = round(
+            float(average_cost) * max(int(travelers), 1),
+            2,
+        )
+    return True
+
+
 def _enrich_hotel(hotel: HotelItem, city: str | None = None) -> bool:
     """补全单个酒店的地址和经纬度。"""
     place = _pick_best_place(hotel.name, city=city)
@@ -468,11 +515,26 @@ def _enrich_transport(transport: TransportItem, city: str | None = None) -> bool
     return True
 
 
-def enrich_itinerary_with_map_data(itinerary: Itinerary, city: str | None = None) -> Itinerary:
+def enrich_itinerary_with_map_data(
+    itinerary: Itinerary,
+    city: str | None = None,
+    travelers: int | None = None,
+) -> Itinerary:
     """使用高德服务补全 itinerary 里的地图字段。"""
     enriched_count = 0
 
     for day in itinerary.days:
+        for meal in day.meals:
+            try:
+                if _enrich_meal(
+                    meal,
+                    city=city or itinerary.destination,
+                    travelers=travelers,
+                ):
+                    enriched_count += 1
+            except Exception:
+                continue
+
         for spot in day.spots:
             try:
                 if _enrich_spot(spot, city=city or itinerary.destination):

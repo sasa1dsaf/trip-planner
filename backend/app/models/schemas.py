@@ -163,6 +163,7 @@ class Itinerary(BaseModel):
 
     trip_id: str = Field(..., description="行程唯一标识")
     destination: str = Field(..., description="目的地")
+    travelers: int = Field(default=1, ge=1, description="出行人数")
     summary: str = Field(..., description="整趟行程的概述")
     days: list[DayPlan] = Field(default_factory=list, description="逐日行程")
     estimated_budget: float = Field(default=0.0, ge=0, description="预算总计")
